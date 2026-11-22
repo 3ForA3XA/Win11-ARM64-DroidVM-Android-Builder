@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>DroidVM Win11 ARM64 Builder</title>
+<style>
+  :root { --bg:#0f1115; --card:#171b23; --fg:#e6e9ef; --acc:#4f8cff; --ok:#3fbf6f; --warn:#e0a53f; --err:#e05252; }
+  * { box-sizing:border-box; margin:0; padding:0; font-family:system-ui,sans-serif; }
+  body { background:var(--bg); color:var(--fg); padding:14px; max-width:640px; margin:0 auto; font-size:15px; }
+  h1 { font-size:19px; margin:6px 0 2px; }
+  .sub { color:#8a92a3; font-size:12px; margin-bottom:14px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:#aeb6c6; margin:10px 0 4px; }
+  input, select { width:100%; background:#0d0f13; color:var(--fg); border:1px solid #2a3040; border-radius:8px; padding:10px; font-size:14px; }
+  input:focus { outline:none; border-color:var(--acc); }
+  .row { display:flex; gap:8px; }
+  .row > input { flex:1; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; margin-top:10px; }
+  button:disabled { opacity:.4; }
+  button.ghost { background:#252b38; }
+  button.big { width:100%; padding:14px; font-size:16px; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:10px; font-size:12px; margin-left:6px; }
+  .ok { background:#12321f; color:var(--ok); }
+  .err { background:#331414; color:var(--err); }
+  #log { background:#0a0c10; border-radius:10px; padding:10px; font-family:monospace; font-size:11px;
+         height:240px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; color:#9fb3d1; margin-top:10px; }
+  .hint { font-size:11px; color:#6e7686; margin-top:6px; line-height:1.5; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .status { margin:8px 0; font-size:13px; }
+  .spin { display:inline-block; animation:r 1s linear infinite; }
+  @keyframes r { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+  <h1>DroidVM Win11 Builder<span id="envBadge" class="badge">检查中…</span></h1>
+  <div class="sub">root + Gunyah 设备专用 · 产出 DroidVM 可导入的 raw 磁盘镜像</div>
+
+  <div class="card">
+    <label>Win11 ARM64 ISO（必填，5.5GB+）</label>
+    <div class="row">
+      <input id="isoPath" placeholder="/storage/emulated/0/Download/Win11....iso">
+      <button class="ghost" onclick="scan()">扫描</button>
+    </div>
+    <label>Gunyah/VirtIO 驱动 zip（可选）</label>
+    <div class="row">
+      <input id="drvPath" placeholder="gunyah-guest-drivers-windows.zip">
+      <button class="ghost" onclick="scanDrv()">扫描</button>
+    </div>
+    <div class="grid2">
+      <div>
+        <label>系统盘大小 (MB)</label>
+        <input id="diskMb" value="40960">
+      </div>
+      <div>
+        <label>ESP 大小 (MB)</label>
+        <input id="espMb" value="512">
+      </div>
+      <div>
+        <label>用户名</label>
+        <input id="username" value="USER">
+      </div>
+      <div>
+        <label>密码</label>
+        <input id="password" value="USER">
+      </div>
+    </div>
+    <label>输出路径</label>
+    <input id="outImg" value="/storage/emulated/0/DroidVM/Windows.raw">
+    <label>WIM 索引（留空自动选 Pro）</label>
+    <input id="imgIndex" placeholder="自动">
+    <button class="big" id="goBtn" onclick="startBuild()">开始构建</button>
+    <button class="ghost" id="stopBtn" onclick="Dvmw.cancel()" style="width:100%" disabled>停止</button>
+    <div class="hint">构建全程 root 文件操作（无虚拟机），约 20–60 分钟。<br>需要约 2× 磁盘大小空闲空间。镜像完成后在 DroidVM 中导入 raw 磁盘即可。</div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="card">
+    <label>构建日志</label>
+    <div id="log"></div>
+  </div>
+
+<script>
+window.__log = function(line) {
+  const el = document.getElementById('log');
+  el.textContent += line + '\n';
+  el.scrollTop = el.scrollHeight;
+  if (line.indexOf('=== DONE') >= 0) finish(true, '构建完成！用 DroidVM 导入 raw 镜像');
+  if (line.indexOf('[FATAL]') >= 0) finish(false, line);
+};
+window.__event = function(name, value) {
+  if (name === 'done') {
+    finish(value === '0', value === '0' ? '构建完成！用 DroidVM 导入 raw 镜像' : '构建退出码 ' + value);
+  }
+};
+function env() {
+  try {
+    const j = JSON.parse(Dvmw.checkEnv());
+    const b = document.getElementById('envBadge');
+    if (j.root && j.tools) { b.textContent = 'root ✓ 工具 ✓'; b.className = 'badge ok'; }
+    else { b.textContent = j.root ? '缺工具!' : '缺 root!'; b.className = 'badge err'; }
+    if (!j.root) document.getElementById('goBtn').disabled = true;
+  } catch(e) {
+    const b = document.getElementById('envBadge');
+    b.textContent = '桥异常'; b.className = 'badge err';
+  }
+}
+function pickDir() { return ['Download','Documents','DroidVM','DCIM']; }
+function scan() {
+  const res = JSON.parse(Dvmw.scanIso());
+  const isos = res.filter(f => f.toLowerCase().endsWith('.iso'));
+  if (isos.length && document.getElementById('isoPath').value.trim() === '')
+    document.getElementById('isoPath').value = isos[0];
+  window.__log('[扫描] 候选文件: ' + res.length + '，其中 ISO ' + isos.length);
+}
+function scanDrv() {
+  const res = JSON.parse(Dvmw.scanIso());
+  const zips = res.filter(f => f.toLowerCase().endsWith('.zip'));
+  if (zips.length && document.getElementById('drvPath').value.trim() === '')
+    document.getElementById('drvPath').value = zips[0];
+  window.__log('[扫描] zip 候选: ' + zips.length);
+}
+function startBuild() {
+  const iso = document.getElementById('isoPath').value.trim();
+  if (!iso) { alert('请填写 ISO 路径（可点扫描自动发现）'); return; }
+  const cfg = [
+    'ISO_PATH=' + iso,
+    'DRIVERS_ZIP=' + document.getElementById('drvPath').value.trim(),
+    'DISK_MB=' + document.getElementById('diskMb').value.trim(),
+    'ESP_MB=' + document.getElementById('espMb').value.trim(),
+    'USERNAME=' + document.getElementById('username').value.trim(),
+    'PASSWORD=' + document.getElementById('password').value.trim(),
+    'IMG_INDEX=' + document.getElementById('imgIndex').value.trim(),
+    'OUT_IMG=' + document.getElementById('outImg').value.trim()
+  ].join('\n');
+  document.getElementById('goBtn').disabled = true;
+  document.getElementById('stopBtn').disabled = false;
+  document.getElementById('status').innerHTML = '<span class="spin">◍</span> 构建中…';
+  Dvmw.start(cfg);
+}
+function finish(ok, msg) {
+  document.getElementById('goBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  document.getElementById('status').innerHTML =
+    ok ? '<span style="color:var(--ok)">✔ ' + msg + '</span>'
+       : '<span style="color:var(--err)">✖ ' + msg + '</span>';
+}
+env();
+</script>
+</body>
+</html>
